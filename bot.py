@@ -20,7 +20,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "workout.db")
+DB_DIR = os.environ.get("DB_DIR", os.path.dirname(__file__))
+DB_PATH = os.path.join(DB_DIR, "workout.db")
 
 # ---------- Стани для розмов (ConversationHandler) ----------
 NEWDAY_NAME = 1
@@ -386,6 +387,27 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def conversation_timed_out(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Викликається автоматично через CONVERSATION_TIMEOUT бездіяльності.
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "Попередня незавершена дія була автоматично скасована через бездіяльність. "
+            "Можеш спробувати команду ще раз."
+        )
+    return ConversationHandler.END
+
+
+async def restart_on_other_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Спрацьовує, якщо користувач надсилає іншу команду посеред незавершеного сценарію.
+    await update.message.reply_text(
+        "Попередню незавершену дію скасовано. Надішли потрібну команду ще раз."
+    )
+    return ConversationHandler.END
+
+
+CONVERSATION_TIMEOUT = 300  # 5 хвилин бездіяльності — автоматичне скасування
+
+
 # ---------- /history ----------
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -442,10 +464,18 @@ def main():
     app.add_handler(CommandHandler("plan", plan_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
 
+    other_commands_fallback = MessageHandler(filters.COMMAND, restart_on_other_command)
+
+    timeout_handler = MessageHandler(filters.ALL, conversation_timed_out)
+
     newday_conv = ConversationHandler(
         entry_points=[CommandHandler("newday", newday_start)],
-        states={NEWDAY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, newday_save)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        states={
+            NEWDAY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, newday_save)],
+            ConversationHandler.TIMEOUT: [timeout_handler],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), other_commands_fallback],
+        conversation_timeout=CONVERSATION_TIMEOUT,
     )
     app.add_handler(newday_conv)
 
@@ -454,8 +484,10 @@ def main():
         states={
             ADDEX_DAY: [CallbackQueryHandler(addex_day_chosen, pattern=r"^day_")],
             ADDEX_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, addex_name_chosen)],
+            ConversationHandler.TIMEOUT: [timeout_handler],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), other_commands_fallback],
+        conversation_timeout=CONVERSATION_TIMEOUT,
     )
     app.add_handler(addex_conv)
 
@@ -469,8 +501,10 @@ def main():
             LOG_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, log_weight_chosen)],
             LOG_REPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, log_reps_chosen)],
             LOG_MORE: [CallbackQueryHandler(log_more_chosen, pattern=r"^more_")],
+            ConversationHandler.TIMEOUT: [timeout_handler],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), other_commands_fallback],
+        conversation_timeout=CONVERSATION_TIMEOUT,
     )
     app.add_handler(log_conv)
 
