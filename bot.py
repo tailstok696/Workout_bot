@@ -302,8 +302,9 @@ async def log_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return LOG_EXERCISE
 
+    context.user_data["log_names_list"] = names
     keyboard = [
-        [InlineKeyboardButton(n, callback_data=f"ex_{n}")] for n in names
+        [InlineKeyboardButton(n, callback_data=f"exi_{i}")] for i, n in enumerate(names)
     ]
     await update.message.reply_text(
         "Яку вправу записуємо?", reply_markup=InlineKeyboardMarkup(keyboard)
@@ -315,7 +316,12 @@ async def log_exercise_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.callback_query:
         query = update.callback_query
         await query.answer()
-        ex_name = query.data.split("_", 1)[1]
+        idx = int(query.data.split("_", 1)[1])
+        names = context.user_data.get("log_names_list", [])
+        if idx >= len(names):
+            await query.edit_message_text("Список застарів, спробуй /log ще раз.")
+            return ConversationHandler.END
+        ex_name = names[idx]
         context.user_data["log_exercise"] = ex_name
         await query.edit_message_text(f"Вправа: {ex_name}\nВведи вагу (кг), наприклад: 60")
     else:
@@ -372,7 +378,10 @@ async def log_more_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif choice == "more_other":
         user_id = update.effective_user.id
         names = get_all_exercise_names(user_id)
-        keyboard = [[InlineKeyboardButton(n, callback_data=f"ex_{n}")] for n in names]
+        context.user_data["log_names_list"] = names
+        keyboard = [
+            [InlineKeyboardButton(n, callback_data=f"exi_{i}")] for i, n in enumerate(names)
+        ]
         await query.edit_message_text(
             "Яку вправу записуємо?", reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -417,7 +426,10 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not names:
             await update.message.reply_text("У тебе ще немає жодного запису.")
             return
-        keyboard = [[InlineKeyboardButton(n, callback_data=f"hist_{n}")] for n in names]
+        context.user_data["hist_names_list"] = names
+        keyboard = [
+            [InlineKeyboardButton(n, callback_data=f"histi_{i}")] for i, n in enumerate(names)
+        ]
         await update.message.reply_text(
             "Прогрес по якій вправі показати?", reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -430,7 +442,12 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    ex_name = query.data.split("_", 1)[1]
+    idx = int(query.data.split("_", 1)[1])
+    names = context.user_data.get("hist_names_list", [])
+    if idx >= len(names):
+        await query.edit_message_text("Список застарів, спробуй /history ще раз.")
+        return
+    ex_name = names[idx]
     await send_history(query.message, update.effective_user.id, ex_name, edit=query)
 
 
@@ -495,7 +512,7 @@ def main():
         entry_points=[CommandHandler("log", log_start)],
         states={
             LOG_EXERCISE: [
-                CallbackQueryHandler(log_exercise_chosen, pattern=r"^ex_"),
+                CallbackQueryHandler(log_exercise_chosen, pattern=r"^exi_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, log_exercise_chosen),
             ],
             LOG_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, log_weight_chosen)],
@@ -509,7 +526,7 @@ def main():
     app.add_handler(log_conv)
 
     app.add_handler(CommandHandler("history", history_cmd))
-    app.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist_"))
+    app.add_handler(CallbackQueryHandler(history_callback, pattern=r"^histi_"))
 
     logger.info("Бот запущено...")
     app.run_polling()
@@ -517,3 +534,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
