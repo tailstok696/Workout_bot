@@ -3,7 +3,7 @@ import sqlite3
 import logging
 from datetime import datetime, date
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,6 +27,16 @@ DB_PATH = os.path.join(DB_DIR, "workout.db")
 NEWDAY_NAME = 1
 ADDEX_DAY, ADDEX_NAME = range(2, 4)
 LOG_EXERCISE, LOG_WEIGHT, LOG_REPS, LOG_MORE = range(4, 8)
+EDITEX_DAY, EDITEX_EXERCISE, EDITEX_NAME = range(8, 11)
+
+MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["/log", "/today"],
+        ["/plan", "/history"],
+        ["/newday", "/addex", "/editex"],
+    ],
+    resize_keyboard=True,
+)
 
 
 # ---------- Робота з базою даних ----------
@@ -167,6 +177,20 @@ def today_logs(user_id):
     return rows
 
 
+def rename_exercise(exercise_id, new_name):
+    conn = get_conn()
+    conn.execute("UPDATE exercises SET name = ? WHERE id = ?", (new_name, exercise_id))
+    conn.commit()
+    conn.close()
+
+
+def get_exercise_by_id(exercise_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM exercises WHERE id = ?", (exercise_id,)).fetchone()
+    conn.close()
+    return row
+
+
 # ---------- Команди ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -174,13 +198,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Що я вмію:\n"
         "• /newday — додати день тренування (наприклад «Ноги», «Спина+біцепс»)\n"
         "• /addex — додати вправу до дня\n"
+        "• /editex — змінити назву вже доданої вправи\n"
         "• /plan — показати весь план тренувань\n"
         "• /log — записати підхід (вага x повтори) під час тренування\n"
         "• /today — що вже записано сьогодні\n"
         "• /history — прогрес по конкретній вправі\n\n"
         "Почни з /newday, щоб створити перший день плану!"
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=MAIN_MENU_KEYBOARD)
 
 
 async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -188,7 +213,8 @@ async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = get_days(user_id)
     if not days:
         await update.message.reply_text(
-            "У тебе ще немає плану. Створи день командою /newday"
+            "У тебе ще немає плану. Створи день командою /newday",
+            reply_markup=MAIN_MENU_KEYBOARD,
         )
         return
 
@@ -201,14 +227,17 @@ async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, e in enumerate(exs, 1):
             lines.append(f"   {i}. {e['name']}")
         lines.append("")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU_KEYBOARD)
 
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = today_logs(user_id)
     if not rows:
-        await update.message.reply_text("Сьогодні ще немає записаних підходів. Використай /log")
+        await update.message.reply_text(
+            "Сьогодні ще немає записаних підходів. Використай /log",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
         return
     by_ex = {}
     for r in rows:
@@ -219,7 +248,7 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in sets:
             lines.append(f"   Підхід {s['set_number']}: {s['weight']} кг x {s['reps']} повт.")
         lines.append("")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU_KEYBOARD)
 
 
 # ---------- /newday ----------
@@ -244,7 +273,8 @@ async def newday_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     await update.message.reply_text(
-        f"Додано день «{name}» ✅\nТепер додай вправи командою /addex"
+        f"Додано день «{name}» ✅\nТепер додай вправи командою /addex",
+        reply_markup=MAIN_MENU_KEYBOARD,
     )
     return ConversationHandler.END
 
@@ -271,8 +301,23 @@ async def addex_day_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     day_id = int(query.data.split("_")[1])
     context.user_data["addex_day_id"] = day_id
-    await query.edit_message_text("Введи назву вправи (наприклад: Жим лежачи)")
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_addex_day")]])
+    await query.edit_message_text(
+        "Введи назву вправи (наприклад: Жим лежачи)", reply_markup=keyboard
+    )
     return ADDEX_NAME
+
+
+async def addex_back_to_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    days = get_days(user_id)
+    keyboard = [[InlineKeyboardButton(d["name"], callback_data=f"day_{d['id']}")] for d in days]
+    await query.edit_message_text(
+        "До якого дня додати вправу?", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADDEX_DAY
 
 
 async def addex_name_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,7 +332,93 @@ async def addex_name_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"Додано вправу «{name}» ✅\nМожеш додати ще: /addex")
+    await update.message.reply_text(
+        f"Додано вправу «{name}» ✅\nМожеш додати ще: /addex", reply_markup=MAIN_MENU_KEYBOARD
+    )
+    return ConversationHandler.END
+
+
+# ---------- /editex ----------
+async def editex_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    days = get_days(user_id)
+    if not days:
+        await update.message.reply_text("Спочатку створи день тренування: /newday")
+        return ConversationHandler.END
+
+    keyboard = [[InlineKeyboardButton(d["name"], callback_data=f"eday_{d['id']}")] for d in days]
+    await update.message.reply_text(
+        "У якому дні хочеш змінити вправу?", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return EDITEX_DAY
+
+
+async def editex_day_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    day_id = int(query.data.split("_", 1)[1])
+    context.user_data["editex_day_id"] = day_id
+    exs = get_exercises_for_day(day_id)
+    if not exs:
+        await query.edit_message_text("У цьому дні ще немає вправ. Додай через /addex")
+        return ConversationHandler.END
+
+    keyboard = [[InlineKeyboardButton(e["name"], callback_data=f"eex_{e['id']}")] for e in exs]
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="editex_back_to_day")])
+    await query.edit_message_text(
+        "Яку вправу змінити?", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return EDITEX_EXERCISE
+
+
+async def editex_back_to_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    days = get_days(user_id)
+    keyboard = [[InlineKeyboardButton(d["name"], callback_data=f"eday_{d['id']}")] for d in days]
+    await query.edit_message_text(
+        "У якому дні хочеш змінити вправу?", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return EDITEX_DAY
+
+
+async def editex_exercise_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ex_id = int(query.data.split("_", 1)[1])
+    context.user_data["editex_id"] = ex_id
+    ex = get_exercise_by_id(ex_id)
+    old_name = ex["name"] if ex else ""
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Назад", callback_data="editex_back_to_exercise")]]
+    )
+    await query.edit_message_text(
+        f"Поточна назва: «{old_name}»\nВведи нову назву вправи:", reply_markup=keyboard
+    )
+    return EDITEX_NAME
+
+
+async def editex_back_to_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    day_id = context.user_data.get("editex_day_id")
+    exs = get_exercises_for_day(day_id)
+    keyboard = [[InlineKeyboardButton(e["name"], callback_data=f"eex_{e['id']}")] for e in exs]
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="editex_back_to_day")])
+    await query.edit_message_text(
+        "Яку вправу змінити?", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return EDITEX_EXERCISE
+
+
+async def editex_name_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text.strip()
+    ex_id = context.user_data.get("editex_id")
+    rename_exercise(ex_id, new_name)
+    await update.message.reply_text(
+        f"Вправу оновлено на «{new_name}» ✅\nПеревір: /plan", reply_markup=MAIN_MENU_KEYBOARD
+    )
     return ConversationHandler.END
 
 
@@ -312,6 +443,14 @@ async def log_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LOG_EXERCISE
 
 
+def weight_prompt_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_exercise")]])
+
+
+def reps_prompt_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_weight")]])
+
+
 async def log_exercise_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         query = update.callback_query
@@ -323,30 +462,66 @@ async def log_exercise_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ConversationHandler.END
         ex_name = names[idx]
         context.user_data["log_exercise"] = ex_name
-        await query.edit_message_text(f"Вправа: {ex_name}\nВведи вагу (кг), наприклад: 60")
+        await query.edit_message_text(
+            f"Вправа: {ex_name}\nВведи вагу (кг), наприклад: 60",
+            reply_markup=weight_prompt_keyboard(),
+        )
     else:
         ex_name = update.message.text.strip()
         context.user_data["log_exercise"] = ex_name
-        await update.message.reply_text(f"Вправа: {ex_name}\nВведи вагу (кг), наприклад: 60")
+        await update.message.reply_text(
+            f"Вправа: {ex_name}\nВведи вагу (кг), наприклад: 60",
+            reply_markup=weight_prompt_keyboard(),
+        )
     return LOG_WEIGHT
+
+
+async def back_to_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    names = get_all_exercise_names(user_id)
+    context.user_data["log_names_list"] = names
+    keyboard = [[InlineKeyboardButton(n, callback_data=f"exi_{i}")] for i, n in enumerate(names)]
+    await query.edit_message_text(
+        "Яку вправу записуємо?", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return LOG_EXERCISE
 
 
 async def log_weight_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         weight = float(update.message.text.replace(",", ".").strip())
     except ValueError:
-        await update.message.reply_text("Це не схоже на число. Введи вагу ще раз, наприклад: 60")
+        await update.message.reply_text(
+            "Це не схоже на число. Введи вагу ще раз, наприклад: 60",
+            reply_markup=weight_prompt_keyboard(),
+        )
         return LOG_WEIGHT
     context.user_data["log_weight"] = weight
-    await update.message.reply_text("Скільки повторів?")
+    await update.message.reply_text("Скільки повторів?", reply_markup=reps_prompt_keyboard())
     return LOG_REPS
+
+
+async def back_to_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ex_name = context.user_data.get("log_exercise", "")
+    await query.edit_message_text(
+        f"Вправа: {ex_name}\nВведи вагу (кг), наприклад: 60",
+        reply_markup=weight_prompt_keyboard(),
+    )
+    return LOG_WEIGHT
 
 
 async def log_reps_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         reps = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("Введи кількість повторів цілим числом, наприклад: 10")
+        await update.message.reply_text(
+            "Введи кількість повторів цілим числом, наприклад: 10",
+            reply_markup=reps_prompt_keyboard(),
+        )
         return LOG_REPS
 
     user_id = update.effective_user.id
@@ -373,7 +548,9 @@ async def log_more_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if choice == "more_same":
         ex_name = context.user_data["log_exercise"]
-        await query.edit_message_text(f"Вправа: {ex_name}\nВведи вагу (кг):")
+        await query.edit_message_text(
+            f"Вправа: {ex_name}\nВведи вагу (кг):", reply_markup=weight_prompt_keyboard()
+        )
         return LOG_WEIGHT
     elif choice == "more_other":
         user_id = update.effective_user.id
@@ -392,7 +569,7 @@ async def log_more_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Скасовано.")
+    await update.message.reply_text("Скасовано.", reply_markup=MAIN_MENU_KEYBOARD)
     return ConversationHandler.END
 
 
@@ -500,13 +677,35 @@ def main():
         entry_points=[CommandHandler("addex", addex_start)],
         states={
             ADDEX_DAY: [CallbackQueryHandler(addex_day_chosen, pattern=r"^day_")],
-            ADDEX_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, addex_name_chosen)],
+            ADDEX_NAME: [
+                CallbackQueryHandler(addex_back_to_day, pattern=r"^back_to_addex_day$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, addex_name_chosen),
+            ],
             ConversationHandler.TIMEOUT: [timeout_handler],
         },
         fallbacks=[CommandHandler("cancel", cancel), other_commands_fallback],
         conversation_timeout=CONVERSATION_TIMEOUT,
     )
     app.add_handler(addex_conv)
+
+    editex_conv = ConversationHandler(
+        entry_points=[CommandHandler("editex", editex_start)],
+        states={
+            EDITEX_DAY: [CallbackQueryHandler(editex_day_chosen, pattern=r"^eday_")],
+            EDITEX_EXERCISE: [
+                CallbackQueryHandler(editex_back_to_day, pattern=r"^editex_back_to_day$"),
+                CallbackQueryHandler(editex_exercise_chosen, pattern=r"^eex_"),
+            ],
+            EDITEX_NAME: [
+                CallbackQueryHandler(editex_back_to_exercise, pattern=r"^editex_back_to_exercise$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, editex_name_chosen),
+            ],
+            ConversationHandler.TIMEOUT: [timeout_handler],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), other_commands_fallback],
+        conversation_timeout=CONVERSATION_TIMEOUT,
+    )
+    app.add_handler(editex_conv)
 
     log_conv = ConversationHandler(
         entry_points=[CommandHandler("log", log_start)],
@@ -515,8 +714,14 @@ def main():
                 CallbackQueryHandler(log_exercise_chosen, pattern=r"^exi_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, log_exercise_chosen),
             ],
-            LOG_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, log_weight_chosen)],
-            LOG_REPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, log_reps_chosen)],
+            LOG_WEIGHT: [
+                CallbackQueryHandler(back_to_exercise, pattern=r"^back_to_exercise$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, log_weight_chosen),
+            ],
+            LOG_REPS: [
+                CallbackQueryHandler(back_to_weight, pattern=r"^back_to_weight$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, log_reps_chosen),
+            ],
             LOG_MORE: [CallbackQueryHandler(log_more_chosen, pattern=r"^more_")],
             ConversationHandler.TIMEOUT: [timeout_handler],
         },
@@ -534,4 +739,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
