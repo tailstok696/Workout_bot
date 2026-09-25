@@ -1,15 +1,14 @@
-
 import os
 import sqlite3
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from io import BytesIO
 
 import matplotlib
 matplotlib.use("Agg")  # без графічного дисплея — потрібно для сервера
 import matplotlib.pyplot as plt
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, LabeledPrice
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,6 +16,7 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     ConversationHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -34,6 +34,7 @@ NEWDAY_NAME = 1
 ADDEX_DAY, ADDEX_NAME = range(2, 4)
 LOG_EXERCISE, LOG_WEIGHT, LOG_REPS, LOG_MORE = range(4, 8)
 EDITEX_DAY, EDITEX_EXERCISE, EDITEX_NAME, EDITEX_ACTION, EDITEX_CONFIRM_DELEX, EDITEX_CONFIRM_DELDAY = range(8, 14)
+EDITEX_DAY_ACTION, EDITEX_DAY_NAME = range(14, 16)
 
 # ---------- Підписи кнопок нижнього меню (українською) ----------
 BTN_LOG = "📝 Записати підхід"
@@ -44,8 +45,9 @@ BTN_RECORDS = "🏆 Рекорди"
 BTN_NEWDAY = "🆕 Новий день"
 BTN_ADDEX = "➕ Додати вправу"
 BTN_EDITEX = "🛠 Керувати вправами"
+BTN_DONATE = "☕ Подякувати автору"
 
-MENU_LABELS = [BTN_LOG, BTN_TODAY, BTN_PLAN, BTN_HISTORY, BTN_RECORDS, BTN_NEWDAY, BTN_ADDEX, BTN_EDITEX]
+MENU_LABELS = [BTN_LOG, BTN_TODAY, BTN_PLAN, BTN_HISTORY, BTN_RECORDS, BTN_NEWDAY, BTN_ADDEX, BTN_EDITEX, BTN_DONATE]
 MENU_BUTTON_FILTER = filters.Text(MENU_LABELS)
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
@@ -53,6 +55,7 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
         [BTN_LOG, BTN_TODAY],
         [BTN_PLAN, BTN_HISTORY, BTN_RECORDS],
         [BTN_NEWDAY, BTN_ADDEX, BTN_EDITEX],
+        [BTN_DONATE],
     ],
     resize_keyboard=True,
 )
@@ -205,6 +208,67 @@ def best_set_per_session(user_id, exercise_name, limit=10):
     return [(d, sessions[d][0], sessions[d][1]) for d in order[:limit]]
 
 
+def get_previous_session_best(user_id, exercise_name, exclude_date):
+    """Найкращий підхід з попереднього (не сьогоднішнього) тренування цієї вправи."""
+    sessions = best_set_per_session(user_id, exercise_name, limit=5)
+    for d, w, r in sessions:
+        if d != exclude_date:
+            return d, w, r
+    return None
+
+
+def suggest_next_target(user_id, exercise_name):
+    """Пропозиція цілі на підхід: вага з минулого разу + невеликий приріст."""
+    prev = get_previous_session_best(user_id, exercise_name, exclude_date=date.today().isoformat())
+    if not prev:
+        return None
+    prev_date, prev_w, prev_r = prev
+    suggested_w = round(prev_w + 2.5, 1)
+    return {"prev_date": prev_date, "prev_w": prev_w, "prev_r": prev_r, "suggested_w": suggested_w}
+
+
+def ukr_days_word(n):
+    if 11 <= n % 100 <= 14:
+        return "днів"
+    last = n % 10
+    if last == 1:
+        return "день"
+    if 2 <= last <= 4:
+        return "дні"
+    return "днів"
+
+
+def get_streak(user_id):
+    """К-ть послідовних днів поспіль із записаними підходами (стрік)."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT log_date FROM logs WHERE user_id = ? ORDER BY log_date DESC", (user_id,)
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return 0
+
+    dates = [date.fromisoformat(r["log_date"]) for r in rows]
+    today = date.today()
+    if dates[0] not in (today, today - timedelta(days=1)):
+        return 0  # останнє тренування було більше дня тому — стрік перервано
+
+    streak = 1
+    for i in range(1, len(dates)):
+        if dates[i - 1] - dates[i] == timedelta(days=1):
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def rename_day(day_id, new_name):
+    conn = get_conn()
+    conn.execute("UPDATE days SET name = ? WHERE id = ?", (new_name, day_id))
+    conn.commit()
+    conn.close()
+
+
 def today_logs(user_id):
     log_date = date.today().isoformat()
     conn = get_conn()
@@ -320,7 +384,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• {BTN_TODAY} — що вже записано сьогодні\n"
         f"• {BTN_HISTORY} — прогрес по вправі (текстом або графіком)\n"
         f"• {BTN_RECORDS} — твій рекорд по вправі, розрахунковий 1ПМ і рекомендовані ваги "
-        "для легкого/середнього/важкого тренування\n\n"
+        "для легкого/середнього/важкого тренування\n"
+        f"• {BTN_DONATE} — якщо бот сподобався і хочеш підтримати автора\n\n"
         f"Почни з «{BTN_NEWDAY}», щоб створити перший день плану!"
     )
     await update.message.reply_text(text, reply_markup=MAIN_MENU_KEYBOARD)
@@ -366,6 +431,9 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in sets:
             lines.append(f"   Підхід {s['set_number']}: {s['weight']} кг x {s['reps']} повт.")
         lines.append("")
+    streak = get_streak(user_id)
+    if streak >= 2:
+        lines.append(f"🔥 Стрік: {streak} {ukr_days_word(streak)} поспіль!")
     await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU_KEYBOARD)
 
 
@@ -456,17 +524,21 @@ async def addex_name_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- /editex (перейменувати або видалити вправу/день) ----------
+# ---------- /editex (перейменувати/видалити день або вправу) ----------
 def build_day_list_keyboard(days):
-    keyboard = []
-    for d in days:
-        keyboard.append(
-            [
-                InlineKeyboardButton(d["name"], callback_data=f"eday_{d['id']}"),
-                InlineKeyboardButton("🗑 Видалити день", callback_data=f"delday_{d['id']}"),
-            ]
-        )
+    keyboard = [[InlineKeyboardButton(d["name"], callback_data=f"eday_{d['id']}")] for d in days]
     return InlineKeyboardMarkup(keyboard)
+
+
+def build_day_action_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🛠 Керувати вправами", callback_data="dayaction_exercises")],
+            [InlineKeyboardButton("✏️ Перейменувати день", callback_data="dayaction_rename")],
+            [InlineKeyboardButton("🗑 Видалити день", callback_data="dayaction_delete")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="editex_back_to_daylist")],
+        ]
+    )
 
 
 def build_exercise_list_keyboard(exs):
@@ -493,35 +565,80 @@ async def editex_day_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     day_id = int(query.data.split("_", 1)[1])
     context.user_data["editex_day_id"] = day_id
-    exs = get_exercises_for_day(day_id)
-    if not exs:
-        await query.edit_message_text(f"У цьому дні ще немає вправ. Додай через {BTN_ADDEX}")
-        return ConversationHandler.END
-
-    await query.edit_message_text("Яку вправу редагувати?", reply_markup=build_exercise_list_keyboard(exs))
-    return EDITEX_EXERCISE
+    day = get_day_by_id(day_id)
+    day_name = day["name"] if day else ""
+    await query.edit_message_text(f"День: «{day_name}»\nЩо зробити?", reply_markup=build_day_action_keyboard())
+    return EDITEX_DAY_ACTION
 
 
-async def editex_delday_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def editex_back_to_daylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    day_id = int(query.data.split("_", 1)[1])
-    context.user_data["editex_day_id"] = day_id
-    day = get_day_by_id(day_id)
-    exs = get_exercises_for_day(day_id)
+    user_id = update.effective_user.id
+    days = get_days(user_id)
+    await query.edit_message_text("З яким днем працюємо?", reply_markup=build_day_list_keyboard(days))
+    return EDITEX_DAY
+
+
+async def editex_back_to_dayaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    day = get_day_by_id(context.user_data.get("editex_day_id"))
     day_name = day["name"] if day else ""
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Так, видалити", callback_data="delday_yes")],
-            [InlineKeyboardButton("❌ Скасувати", callback_data="delday_no")],
-        ]
+    await query.edit_message_text(f"День: «{day_name}»\nЩо зробити?", reply_markup=build_day_action_keyboard())
+    return EDITEX_DAY_ACTION
+
+
+async def editex_day_action_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    day_id = context.user_data.get("editex_day_id")
+
+    if query.data == "dayaction_exercises":
+        exs = get_exercises_for_day(day_id)
+        if not exs:
+            await query.edit_message_text(f"У цьому дні ще немає вправ. Додай через {BTN_ADDEX}")
+            return ConversationHandler.END
+        await query.edit_message_text("Яку вправу редагувати?", reply_markup=build_exercise_list_keyboard(exs))
+        return EDITEX_EXERCISE
+
+    elif query.data == "dayaction_rename":
+        day = get_day_by_id(day_id)
+        day_name = day["name"] if day else ""
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="editex_back_to_dayaction")]]
+        )
+        await query.edit_message_text(
+            f"Поточна назва дня: «{day_name}»\nВведи нову назву:", reply_markup=keyboard
+        )
+        return EDITEX_DAY_NAME
+
+    else:  # dayaction_delete
+        day = get_day_by_id(day_id)
+        exs = get_exercises_for_day(day_id)
+        day_name = day["name"] if day else ""
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ Так, видалити", callback_data="delday_yes")],
+                [InlineKeyboardButton("❌ Скасувати", callback_data="delday_no")],
+            ]
+        )
+        await query.edit_message_text(
+            f"Точно видалити день «{day_name}» разом з {len(exs)} вправами?\n"
+            "(Історія вже записаних підходів залишиться, видаляється лише план.)",
+            reply_markup=keyboard,
+        )
+        return EDITEX_CONFIRM_DELDAY
+
+
+async def editex_day_name_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text.strip()
+    day_id = context.user_data.get("editex_day_id")
+    rename_day(day_id, new_name)
+    await update.message.reply_text(
+        f"День перейменовано на «{new_name}» ✅\nПеревір: {BTN_PLAN}", reply_markup=MAIN_MENU_KEYBOARD
     )
-    await query.edit_message_text(
-        f"Точно видалити день «{day_name}» разом з {len(exs)} вправами?\n"
-        "(Історія вже записаних підходів залишиться, видаляється лише план.)",
-        reply_markup=keyboard,
-    )
-    return EDITEX_CONFIRM_DELDAY
+    return ConversationHandler.END
 
 
 async def editex_delday_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -533,19 +650,12 @@ async def editex_delday_confirmed(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("День видалено ✅")
         return ConversationHandler.END
     else:
-        user_id = update.effective_user.id
-        days = get_days(user_id)
-        await query.edit_message_text("Скасовано.\nЗ яким днем працюємо?", reply_markup=build_day_list_keyboard(days))
-        return EDITEX_DAY
+        return await editex_back_to_dayaction(update, context)
 
 
 async def editex_back_to_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    days = get_days(user_id)
-    await query.edit_message_text("З яким днем працюємо?", reply_markup=build_day_list_keyboard(days))
-    return EDITEX_DAY
+    # "Назад" зі списку вправ дня — повертає до меню дій над днем
+    return await editex_back_to_dayaction(update, context)
 
 
 async def editex_exercise_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -668,7 +778,20 @@ def reps_prompt_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_weight")]])
 
 
+def build_weight_prompt_text(user_id, ex_name):
+    text = f"Вправа: {ex_name}\n"
+    target = suggest_next_target(user_id, ex_name)
+    if target:
+        text += (
+            f"Минулого разу ({target['prev_date']}): {target['prev_w']} кг x {target['prev_r']} повт.\n"
+            f"🎯 Спробуй: {target['suggested_w']} кг x {target['prev_r']} повт.\n"
+        )
+    text += "Введи вагу (кг), наприклад: 60"
+    return text
+
+
 async def log_exercise_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     if update.callback_query:
         query = update.callback_query
         await query.answer()
@@ -680,14 +803,14 @@ async def log_exercise_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
         ex_name = names[idx]
         context.user_data["log_exercise"] = ex_name
         await query.edit_message_text(
-            f"Вправа: {ex_name}\nВведи вагу (кг), наприклад: 60",
+            build_weight_prompt_text(user_id, ex_name),
             reply_markup=weight_prompt_keyboard(),
         )
     else:
         ex_name = update.message.text.strip()
         context.user_data["log_exercise"] = ex_name
         await update.message.reply_text(
-            f"Вправа: {ex_name}\nВведи вагу (кг), наприклад: 60",
+            build_weight_prompt_text(user_id, ex_name),
             reply_markup=weight_prompt_keyboard(),
         )
     return LOG_WEIGHT
@@ -786,12 +909,25 @@ async def log_reps_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_new_record = (not prev_best) or weight > prev_best["weight"] or (
             weight == prev_best["weight"] and reps > prev_best["reps"]
         )
+        today_str = date.today().isoformat()
+        prev_session = get_previous_session_best(user_id, ex_name, exclude_date=today_str)
+
         set_number, log_id = add_log(user_id, ex_name, weight, reps)
         context.user_data["log_last_id"] = log_id
         context.user_data["log_last_set_number"] = set_number
         confirm_text = f"Записано: {ex_name}, підхід {set_number} — {weight} кг x {reps} повт. ✅"
+
         if is_new_record:
             confirm_text += f"\n🎉 Новий рекорд ваги для цієї вправи! (1ПМ ≈ {estimate_1rm(weight, reps)} кг)"
+        elif prev_session:
+            prev_date, prev_w, prev_r = prev_session
+            curr_1rm = estimate_1rm(weight, reps)
+            prev_1rm = estimate_1rm(prev_w, prev_r)
+            if curr_1rm > prev_1rm:
+                confirm_text += (
+                    f"\n📈 Це більше, ніж минулого разу! ({prev_w} кг x {prev_r} → "
+                    f"{weight} кг x {reps})"
+                )
 
     await update.message.reply_text(confirm_text, reply_markup=log_more_keyboard())
     return LOG_MORE
@@ -833,7 +969,12 @@ async def log_more_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return LOG_EXERCISE
     else:
-        await query.edit_message_text(f"Тренування записано. Гарного відновлення! 💪\nПодивитись: {BTN_TODAY}")
+        user_id = update.effective_user.id
+        streak = get_streak(user_id)
+        streak_line = f"\n🔥 Стрік: {streak} {ukr_days_word(streak)} поспіль!" if streak >= 2 else ""
+        await query.edit_message_text(
+            f"Тренування записано. Гарного відновлення! 💪{streak_line}\nПодивитись: {BTN_TODAY}"
+        )
         return ConversationHandler.END
 
 
@@ -988,6 +1129,46 @@ async def send_record(query, user_id, ex_name):
     await query.edit_message_text("\n".join(lines))
 
 
+# ---------- ☕ Подякувати автору (Telegram Stars) ----------
+DONATE_AMOUNTS = [20, 50, 100, 250]
+
+
+async def donate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton(f"⭐ {amount}", callback_data=f"donate_{amount}") for amount in DONATE_AMOUNTS]
+    ]
+    await update.message.reply_text(
+        "Дякую, що хочеш підтримати розробку бота! 🙏\nОбери суму у Зірках Telegram:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def donate_amount_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    amount = int(query.data.split("_", 1)[1])
+    await context.bot.send_invoice(
+        chat_id=query.message.chat_id,
+        title="Подяка автору бота",
+        description="Невелика підтримка розробки та підтримки TrainingProg ☕",
+        payload=f"donate_{amount}",
+        provider_token="",  # порожній рядок — оплата в Telegram Stars
+        currency="XTR",
+        prices=[LabeledPrice("Подяка", amount)],
+    )
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.pre_checkout_query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amount = update.message.successful_payment.total_amount
+    await update.message.reply_text(
+        f"Дякую за підтримку — {amount} ⭐! Дуже приємно 🙏", reply_markup=MAIN_MENU_KEYBOARD
+    )
+
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -999,6 +1180,12 @@ def main():
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
+
+    app.add_handler(CommandHandler("donate", donate_start))
+    app.add_handler(MessageHandler(filters.Text([BTN_DONATE]), donate_start))
+    app.add_handler(CallbackQueryHandler(donate_amount_chosen, pattern=r"^donate_\d+$"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(CommandHandler("plan", plan_cmd))
     app.add_handler(MessageHandler(filters.Text([BTN_PLAN]), plan_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
@@ -1049,8 +1236,15 @@ def main():
         ],
         states={
             EDITEX_DAY: [
-                CallbackQueryHandler(editex_delday_ask, pattern=r"^delday_\d+$"),
                 CallbackQueryHandler(editex_day_chosen, pattern=r"^eday_"),
+            ],
+            EDITEX_DAY_ACTION: [
+                CallbackQueryHandler(editex_back_to_daylist, pattern=r"^editex_back_to_daylist$"),
+                CallbackQueryHandler(editex_day_action_chosen, pattern=r"^dayaction_"),
+            ],
+            EDITEX_DAY_NAME: [
+                CallbackQueryHandler(editex_back_to_dayaction, pattern=r"^editex_back_to_dayaction$"),
+                MessageHandler(free_text_filter, editex_day_name_chosen),
             ],
             EDITEX_EXERCISE: [
                 CallbackQueryHandler(editex_back_to_day, pattern=r"^editex_back_to_day$"),
@@ -1118,5 +1312,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
