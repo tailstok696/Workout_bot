@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dt_time
 from io import BytesIO
 
 import matplotlib
@@ -35,6 +35,9 @@ ADDEX_DAY, ADDEX_NAME = range(2, 4)
 LOG_EXERCISE, LOG_WEIGHT, LOG_REPS, LOG_MORE = range(4, 8)
 EDITEX_DAY, EDITEX_EXERCISE, EDITEX_NAME, EDITEX_ACTION, EDITEX_CONFIRM_DELEX, EDITEX_CONFIRM_DELDAY = range(8, 14)
 EDITEX_DAY_ACTION, EDITEX_DAY_NAME = range(14, 16)
+BODYWEIGHT_INPUT = 16
+LOG_NOTE = 17
+LOG_DAY = 18
 
 # ---------- Підписи кнопок нижнього меню (українською) ----------
 BTN_LOG = "📝 Записати підхід"
@@ -42,20 +45,27 @@ BTN_TODAY = "📅 Сьогодні"
 BTN_PLAN = "📋 Мій план"
 BTN_HISTORY = "📈 Прогрес"
 BTN_RECORDS = "🏆 Рекорди"
+BTN_WEEKLY = "📊 Тижневий звіт"
+BTN_BODYWEIGHT = "⚖️ Моя вага"
+BTN_EXPORT = "📤 Експорт CSV"
 BTN_NEWDAY = "🆕 Новий день"
 BTN_ADDEX = "➕ Додати вправу"
 BTN_EDITEX = "🛠 Керувати вправами"
 BTN_DONATE = "☕ Подякувати автору"
 
-MENU_LABELS = [BTN_LOG, BTN_TODAY, BTN_PLAN, BTN_HISTORY, BTN_RECORDS, BTN_NEWDAY, BTN_ADDEX, BTN_EDITEX, BTN_DONATE]
+MENU_LABELS = [
+    BTN_LOG, BTN_TODAY, BTN_PLAN, BTN_HISTORY, BTN_RECORDS, BTN_WEEKLY,
+    BTN_BODYWEIGHT, BTN_EXPORT, BTN_NEWDAY, BTN_ADDEX, BTN_EDITEX, BTN_DONATE,
+]
 MENU_BUTTON_FILTER = filters.Text(MENU_LABELS)
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [BTN_LOG, BTN_TODAY],
         [BTN_PLAN, BTN_HISTORY, BTN_RECORDS],
+        [BTN_WEEKLY, BTN_BODYWEIGHT],
         [BTN_NEWDAY, BTN_ADDEX, BTN_EDITEX],
-        [BTN_DONATE],
+        [BTN_EXPORT, BTN_DONATE],
     ],
     resize_keyboard=True,
 )
@@ -71,13 +81,29 @@ PERIODIZATION_ZONES = [
 ]
 
 
+PLATE_STEP = 2.5  # практичний крок диска в залі (кг)
+
+
+def round_to_plate(value, step=PLATE_STEP):
+    """Округлює до найближчого практичного кроку (напр. 2.5 кг) — щоб не було 13.2, 27.4 і т.п."""
+    return round(round(value / step) * step, 2)
+
+
+def fmt_kg(value):
+    """Прибирає зайве .0 при виводі: 60.0 -> '60', 62.5 -> '62.5'."""
+    value = round(float(value), 2)
+    if value == int(value):
+        return str(int(value))
+    return f"{value:g}"
+
+
 def estimate_1rm(weight, reps):
-    """Формула Еплі: 1ПМ = вага × (1 + повтори/30)."""
-    return round(weight * (1 + reps / 30), 1)
+    """Формула Еплі: 1ПМ = вага × (1 + повтори/30), округлено до цілого кг."""
+    return round(weight * (1 + reps / 30))
 
 
 def periodization_suggestions(one_rm):
-    return [(label, round(one_rm * pct, 1), reps) for label, pct, reps in PERIODIZATION_ZONES]
+    return [(label, round_to_plate(one_rm * pct), reps) for label, pct, reps in PERIODIZATION_ZONES]
 
 
 # ---------- Робота з базою даних ----------
@@ -117,10 +143,201 @@ def init_db():
             reps INTEGER NOT NULL,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS body_weight (
+            user_id INTEGER NOT NULL,
+            log_date TEXT NOT NULL,
+            weight REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, log_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS workout_notes (
+            user_id INTEGER NOT NULL,
+            log_date TEXT NOT NULL,
+            note TEXT NOT NULL,
+            UNIQUE(user_id, log_date)
+        );
         """
     )
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE bot_users ADD COLUMN last_reminder_sent TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # колонка вже існує
     conn.close()
+
+
+def track_user(user_id, username):
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO bot_users (user_id, username, first_seen, last_seen) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET last_seen = excluded.last_seen, username = excluded.username",
+        (user_id, username, now, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_stats():
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) as c FROM bot_users").fetchone()["c"]
+    week_ago = (date.today() - timedelta(days=6)).isoformat()
+    active_7d = conn.execute(
+        "SELECT COUNT(DISTINCT user_id) as c FROM logs WHERE log_date >= ?", (week_ago,)
+    ).fetchone()["c"]
+    total_workouts = conn.execute("SELECT COUNT(DISTINCT user_id || log_date) as c FROM logs").fetchone()["c"]
+    conn.close()
+    return {"total_users": total, "active_7d": active_7d, "total_workouts": total_workouts}
+
+
+def get_all_user_ids():
+    conn = get_conn()
+    rows = conn.execute("SELECT user_id FROM bot_users").fetchall()
+    conn.close()
+    return [r["user_id"] for r in rows]
+
+
+def get_users_needing_reminder(threshold_days=3):
+    """user_id тих, хто не тренувався threshold_days+ днів і кому давно не нагадували."""
+    conn = get_conn()
+    rows = conn.execute("SELECT user_id, last_reminder_sent FROM bot_users").fetchall()
+    conn.close()
+
+    today = date.today()
+    result = []
+    for r in rows:
+        conn2 = get_conn()
+        last_log = conn2.execute(
+            "SELECT MAX(log_date) as d FROM logs WHERE user_id = ?", (r["user_id"],)
+        ).fetchone()
+        conn2.close()
+        if not last_log["d"]:
+            continue  # ще жодного разу не тренувався — не спамимо
+        last_date = date.fromisoformat(last_log["d"])
+        gap = (today - last_date).days
+        if gap < threshold_days:
+            continue
+        if r["last_reminder_sent"]:
+            last_reminded = date.fromisoformat(r["last_reminder_sent"])
+            if (today - last_reminded).days < threshold_days:
+                continue  # вже нагадували нещодавно
+        result.append(r["user_id"])
+    return result
+
+
+def mark_reminder_sent(user_id):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE bot_users SET last_reminder_sent = ? WHERE user_id = ?",
+        (date.today().isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_or_update_bodyweight(user_id, weight):
+    log_date = date.today().isoformat()
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO body_weight (user_id, log_date, weight, created_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id, log_date) DO UPDATE SET weight = excluded.weight",
+        (user_id, log_date, weight, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_bodyweight(user_id, exclude_today=False):
+    conn = get_conn()
+    if exclude_today:
+        today_str = date.today().isoformat()
+        row = conn.execute(
+            "SELECT * FROM body_weight WHERE user_id = ? AND log_date != ? ORDER BY log_date DESC LIMIT 1",
+            (user_id, today_str),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM body_weight WHERE user_id = ? ORDER BY log_date DESC LIMIT 1", (user_id,)
+        ).fetchone()
+    conn.close()
+    return row
+
+
+def get_bodyweight_history(user_id, limit=30):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT log_date, weight FROM body_weight WHERE user_id = ? ORDER BY log_date DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return list(reversed([(r["log_date"], r["weight"]) for r in rows]))
+
+
+def set_workout_note(user_id, log_date, note):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO workout_notes (user_id, log_date, note) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id, log_date) DO UPDATE SET note = excluded.note",
+        (user_id, log_date, note),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_workout_note(user_id, log_date):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT note FROM workout_notes WHERE user_id = ? AND log_date = ?", (user_id, log_date)
+    ).fetchone()
+    conn.close()
+    return row["note"] if row else None
+
+
+def build_csv_export(user_id):
+    import csv
+    import io
+
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT log_date, exercise_name, set_number, weight, reps FROM logs "
+        "WHERE user_id = ? ORDER BY log_date, exercise_name, set_number",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Дата", "Вправа", "Підхід", "Вага (кг)", "Повтори"])
+    for r in rows:
+        writer.writerow([r["log_date"], r["exercise_name"], r["set_number"], r["weight"], r["reps"]])
+    return output.getvalue()
+
+
+def generate_achievement_card(title, main_stat, subtitle):
+    fig, ax = plt.subplots(figsize=(6, 6))
+    fig.patch.set_facecolor("#1e1e2e")
+    ax.set_facecolor("#1e1e2e")
+    ax.axis("off")
+    ax.text(0.5, 0.72, title, ha="center", fontsize=22, color="white", weight="bold", transform=ax.transAxes)
+    ax.text(0.5, 0.48, main_stat, ha="center", fontsize=38, color="#4CAF50", weight="bold", transform=ax.transAxes)
+    ax.text(0.5, 0.30, subtitle, ha="center", fontsize=14, color="#cccccc", transform=ax.transAxes)
+    ax.text(0.5, 0.06, "TrainingProg 💪", ha="center", fontsize=10, color="#888888", transform=ax.transAxes)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 
 # ---------- Допоміжні функції ----------
@@ -223,7 +440,7 @@ def suggest_next_target(user_id, exercise_name):
     if not prev:
         return None
     prev_date, prev_w, prev_r = prev
-    suggested_w = round(prev_w + 2.5, 1)
+    suggested_w = round_to_plate(prev_w + PLATE_STEP)
     return {"prev_date": prev_date, "prev_w": prev_w, "prev_r": prev_r, "suggested_w": suggested_w}
 
 
@@ -267,6 +484,61 @@ def rename_day(day_id, new_name):
     conn.execute("UPDATE days SET name = ? WHERE id = ?", (new_name, day_id))
     conn.commit()
     conn.close()
+
+
+def get_period_logs(user_id, start_date, end_date):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM logs WHERE user_id = ? AND log_date >= ? AND log_date <= ? ORDER BY log_date",
+        (user_id, start_date.isoformat(), end_date.isoformat()),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def build_weekly_report(user_id):
+    """Звіт за останні 7 днів: тренування, тоннаж, найбільший прогрес по 1ПМ порівняно з попередніми 7 днями."""
+    today = date.today()
+    period_start = today - timedelta(days=6)
+    prev_start = today - timedelta(days=13)
+    prev_end = today - timedelta(days=7)
+
+    rows = get_period_logs(user_id, period_start, today)
+    if not rows:
+        return None
+
+    distinct_days = len({r["log_date"] for r in rows})
+    total_sets = len(rows)
+    total_tonnage = sum(r["weight"] * r["reps"] for r in rows)
+
+    best_this = {}
+    for r in rows:
+        rm = estimate_1rm(r["weight"], r["reps"])
+        if r["exercise_name"] not in best_this or rm > best_this[r["exercise_name"]]:
+            best_this[r["exercise_name"]] = rm
+
+    prev_rows = get_period_logs(user_id, prev_start, prev_end)
+    best_prev = {}
+    for r in prev_rows:
+        rm = estimate_1rm(r["weight"], r["reps"])
+        if r["exercise_name"] not in best_prev or rm > best_prev[r["exercise_name"]]:
+            best_prev[r["exercise_name"]] = rm
+
+    improvements = []
+    for ex, rm in best_this.items():
+        prev_rm = best_prev.get(ex)
+        if prev_rm and rm > prev_rm:
+            improvements.append((ex, rm - prev_rm, prev_rm, rm))
+    improvements.sort(key=lambda x: x[1], reverse=True)
+
+    return {
+        "period_start": period_start,
+        "period_end": today,
+        "days": distinct_days,
+        "sets": total_sets,
+        "tonnage": total_tonnage,
+        "improvements": improvements[:3],
+    }
 
 
 def today_logs(user_id):
@@ -385,6 +657,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• {BTN_HISTORY} — прогрес по вправі (текстом або графіком)\n"
         f"• {BTN_RECORDS} — твій рекорд по вправі, розрахунковий 1ПМ і рекомендовані ваги "
         "для легкого/середнього/важкого тренування\n"
+        f"• {BTN_WEEKLY} — підсумок за останні 7 днів: тренування, тоннаж, прогрес\n"
         f"• {BTN_DONATE} — якщо бот сподобався і хочеш підтримати автора\n\n"
         f"Почни з «{BTN_NEWDAY}», щоб створити перший день плану!"
     )
@@ -429,11 +702,14 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for ex, sets in by_ex.items():
         lines.append(f"💪 {ex}")
         for s in sets:
-            lines.append(f"   Підхід {s['set_number']}: {s['weight']} кг x {s['reps']} повт.")
+            lines.append(f"   Підхід {s['set_number']}: {fmt_kg(s['weight'])} кг x {s['reps']} повт.")
         lines.append("")
     streak = get_streak(user_id)
     if streak >= 2:
         lines.append(f"🔥 Стрік: {streak} {ukr_days_word(streak)} поспіль!")
+    note = get_workout_note(user_id, date.today().isoformat())
+    if note:
+        lines.append(f"\n📝 Нотатка: {note}")
     await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU_KEYBOARD)
 
 
@@ -752,22 +1028,47 @@ async def editex_name_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def log_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     context.user_data["editing_last"] = False
-    names = get_all_exercise_names(user_id)
-    if not names:
-        await update.message.reply_text(
-            f"У тебе ще немає вправ у плані. Додай через {BTN_NEWDAY} і {BTN_ADDEX}, "
-            "або просто напиши назву вправи зараз:"
-        )
-        return LOG_EXERCISE
+    days = get_days(user_id)
+    if not days:
+        await update.message.reply_text(f"Спочатку створи день тренування: {BTN_NEWDAY}")
+        return ConversationHandler.END
 
-    context.user_data["log_names_list"] = names
-    keyboard = [
-        [InlineKeyboardButton(n, callback_data=f"exi_{i}")] for i, n in enumerate(names)
-    ]
+    keyboard = [[InlineKeyboardButton(d["name"], callback_data=f"logday_{d['id']}")] for d in days]
     await update.message.reply_text(
-        "Яку вправу записуємо?", reply_markup=InlineKeyboardMarkup(keyboard)
+        "З яким днем працюємо?", reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    return LOG_DAY
+
+
+async def log_day_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    day_id = int(query.data.split("_", 1)[1])
+    context.user_data["log_day_id"] = day_id
+    return await show_log_exercise_list(query, context)
+
+
+async def show_log_exercise_list(query, context):
+    day_id = context.user_data.get("log_day_id")
+    exs = get_exercises_for_day(day_id)
+    if not exs:
+        await query.edit_message_text(f"У цьому дні ще немає вправ. Додай через {BTN_ADDEX}")
+        return ConversationHandler.END
+
+    keyboard = [[InlineKeyboardButton(e["name"], callback_data=f"logexid_{e['id']}")] for e in exs]
+    keyboard.append([InlineKeyboardButton("⬅️ Змінити день", callback_data="back_to_logday")])
+    await query.edit_message_text("Яку вправу записуємо?", reply_markup=InlineKeyboardMarkup(keyboard))
     return LOG_EXERCISE
+
+
+async def back_to_logday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    days = get_days(user_id)
+    keyboard = [[InlineKeyboardButton(d["name"], callback_data=f"logday_{d['id']}")] for d in days]
+    await query.edit_message_text("З яким днем працюємо?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return LOG_DAY
 
 
 def weight_prompt_keyboard():
@@ -783,36 +1084,40 @@ def build_weight_prompt_text(user_id, ex_name):
     target = suggest_next_target(user_id, ex_name)
     if target:
         text += (
-            f"Минулого разу ({target['prev_date']}): {target['prev_w']} кг x {target['prev_r']} повт.\n"
-            f"🎯 Спробуй: {target['suggested_w']} кг x {target['prev_r']} повт.\n"
+            f"Минулого разу ({target['prev_date']}): {fmt_kg(target['prev_w'])} кг x {target['prev_r']} повт.\n"
+            f"🎯 Спробуй: {fmt_kg(target['suggested_w'])} кг x {target['prev_r']} повт.\n"
         )
     text += "Введи вагу (кг), наприклад: 60"
     return text
 
 
 async def log_exercise_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ex_id = int(query.data.split("_", 1)[1])
+    ex = get_exercise_by_id(ex_id)
+    if not ex:
+        await query.edit_message_text(f"Вправу не знайдено, спробуй {BTN_LOG} ще раз.")
+        return ConversationHandler.END
+    ex_name = ex["name"]
+    context.user_data["log_exercise"] = ex_name
     user_id = update.effective_user.id
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        idx = int(query.data.split("_", 1)[1])
-        names = context.user_data.get("log_names_list", [])
-        if idx >= len(names):
-            await query.edit_message_text(f"Список застарів, спробуй {BTN_LOG} ще раз.")
-            return ConversationHandler.END
-        ex_name = names[idx]
-        context.user_data["log_exercise"] = ex_name
-        await query.edit_message_text(
-            build_weight_prompt_text(user_id, ex_name),
-            reply_markup=weight_prompt_keyboard(),
-        )
-    else:
-        ex_name = update.message.text.strip()
-        context.user_data["log_exercise"] = ex_name
-        await update.message.reply_text(
-            build_weight_prompt_text(user_id, ex_name),
-            reply_markup=weight_prompt_keyboard(),
-        )
+    await query.edit_message_text(
+        build_weight_prompt_text(user_id, ex_name),
+        reply_markup=weight_prompt_keyboard(),
+    )
+    return LOG_WEIGHT
+
+
+async def log_custom_exercise_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Дозволяє записати підхід по вправі, якої немає в плані цього дня — вводиш назву вручну.
+    ex_name = update.message.text.strip()
+    context.user_data["log_exercise"] = ex_name
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        build_weight_prompt_text(user_id, ex_name),
+        reply_markup=weight_prompt_keyboard(),
+    )
     return LOG_WEIGHT
 
 
@@ -831,21 +1136,15 @@ async def back_to_exercise(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if log_row:
             text = (
                 f"Записано: {ex_name}, підхід {set_number} — "
-                f"{log_row['weight']} кг x {log_row['reps']} повт. ✅"
+                f"{fmt_kg(log_row['weight'])} кг x {log_row['reps']} повт. ✅"
             )
         else:
             text = "Гаразд, залишаємо як було."
-        await query.edit_message_text(text, reply_markup=log_more_keyboard())
+        weight = context.user_data.get("log_weight")
+        await query.edit_message_text(text, reply_markup=log_more_keyboard(weight))
         return LOG_MORE
 
-    user_id = update.effective_user.id
-    names = get_all_exercise_names(user_id)
-    context.user_data["log_names_list"] = names
-    keyboard = [[InlineKeyboardButton(n, callback_data=f"exi_{i}")] for i, n in enumerate(names)]
-    await query.edit_message_text(
-        "Яку вправу записуємо?", reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return LOG_EXERCISE
+    return await show_log_exercise_list(query, context)
 
 
 async def log_weight_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -873,15 +1172,24 @@ async def back_to_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LOG_WEIGHT
 
 
-def log_more_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("➕ Ще підхід цієї ж вправи", callback_data="more_same")],
-            [InlineKeyboardButton("✏️ Виправити цей підхід", callback_data="more_edit")],
-            [InlineKeyboardButton("🔁 Інша вправа", callback_data="more_other")],
-            [InlineKeyboardButton("✅ Завершити", callback_data="more_done")],
-        ]
-    )
+def log_more_keyboard(weight=None):
+    # Якщо вже знаємо вагу поточного підходу — показуємо швидкі кнопки,
+    # щоб записати наступний підхід (зазвичай їх 3-4 на вправу) в 1 тап,
+    # без повторного набору ваги й повторів.
+    buttons = []
+    if weight is not None:
+        buttons.append(
+            [InlineKeyboardButton("🔂 Такий самий підхід", callback_data="more_repeat")]
+        )
+        buttons.append(
+            [InlineKeyboardButton(f"🔁 Ще підхід ({fmt_kg(weight)} кг)", callback_data="more_sameweight")]
+        )
+    buttons.append([InlineKeyboardButton("➕ Інша вага цієї ж вправи", callback_data="more_same")])
+    buttons.append([InlineKeyboardButton("✏️ Виправити цей підхід", callback_data="more_edit")])
+    buttons.append([InlineKeyboardButton("🔁 Інша вправа", callback_data="more_other")])
+    buttons.append([InlineKeyboardButton("📝 Додати нотатку до тренування", callback_data="more_note")])
+    buttons.append([InlineKeyboardButton("✅ Завершити", callback_data="more_done")])
+    return InlineKeyboardMarkup(buttons)
 
 
 async def log_reps_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -903,7 +1211,8 @@ async def log_reps_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_log(log_id, weight, reps)
         set_number = context.user_data.get("log_last_set_number", "")
         context.user_data["editing_last"] = False
-        confirm_text = f"Виправлено: {ex_name}, підхід {set_number} — {weight} кг x {reps} повт. ✅"
+        context.user_data["log_reps"] = reps
+        confirm_text = f"Виправлено: {ex_name}, підхід {set_number} — {fmt_kg(weight)} кг x {reps} повт. ✅"
     else:
         prev_best = get_max_weight_log(user_id, ex_name)
         is_new_record = (not prev_best) or weight > prev_best["weight"] or (
@@ -915,21 +1224,22 @@ async def log_reps_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_number, log_id = add_log(user_id, ex_name, weight, reps)
         context.user_data["log_last_id"] = log_id
         context.user_data["log_last_set_number"] = set_number
-        confirm_text = f"Записано: {ex_name}, підхід {set_number} — {weight} кг x {reps} повт. ✅"
+        context.user_data["log_reps"] = reps
+        confirm_text = f"Записано: {ex_name}, підхід {set_number} — {fmt_kg(weight)} кг x {reps} повт. ✅"
 
         if is_new_record:
-            confirm_text += f"\n🎉 Новий рекорд ваги для цієї вправи! (1ПМ ≈ {estimate_1rm(weight, reps)} кг)"
+            confirm_text += f"\n🎉 Новий рекорд ваги для цієї вправи! (1ПМ ≈ {fmt_kg(estimate_1rm(weight, reps))} кг)"
         elif prev_session:
             prev_date, prev_w, prev_r = prev_session
             curr_1rm = estimate_1rm(weight, reps)
             prev_1rm = estimate_1rm(prev_w, prev_r)
             if curr_1rm > prev_1rm:
                 confirm_text += (
-                    f"\n📈 Це більше, ніж минулого разу! ({prev_w} кг x {prev_r} → "
-                    f"{weight} кг x {reps})"
+                    f"\n📈 Це більше, ніж минулого разу! ({fmt_kg(prev_w)} кг x {prev_r} → "
+                    f"{fmt_kg(weight)} кг x {reps})"
                 )
 
-    await update.message.reply_text(confirm_text, reply_markup=log_more_keyboard())
+    await update.message.reply_text(confirm_text, reply_markup=log_more_keyboard(weight))
     return LOG_MORE
 
 
@@ -938,7 +1248,41 @@ async def log_more_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     choice = query.data
 
-    if choice == "more_same":
+    if choice == "more_repeat":
+        # Записує підхід з тією ж вагою й тими ж повторами, що й попередній — в 1 тап,
+        # без набору цифр. Зручно для прямих підходів (напр. 4x8 з однаковою вагою).
+        context.user_data["editing_last"] = False
+        user_id = update.effective_user.id
+        ex_name = context.user_data["log_exercise"]
+        weight = context.user_data.get("log_weight")
+        reps = context.user_data.get("log_reps")
+        if weight is None or reps is None:
+            await query.answer("Немає попереднього підходу для повтору", show_alert=True)
+            return LOG_MORE
+
+        prev_best = get_max_weight_log(user_id, ex_name)
+        is_new_record = (not prev_best) or weight > prev_best["weight"] or (
+            weight == prev_best["weight"] and reps > prev_best["reps"]
+        )
+        set_number, log_id = add_log(user_id, ex_name, weight, reps)
+        context.user_data["log_last_id"] = log_id
+        context.user_data["log_last_set_number"] = set_number
+        confirm_text = f"Записано: {ex_name}, підхід {set_number} — {fmt_kg(weight)} кг x {reps} повт. ✅"
+        if is_new_record:
+            confirm_text += f"\n🎉 Новий рекорд ваги для цієї вправи! (1ПМ ≈ {fmt_kg(estimate_1rm(weight, reps))} кг)"
+        await query.edit_message_text(confirm_text, reply_markup=log_more_keyboard(weight))
+        return LOG_MORE
+    elif choice == "more_sameweight":
+        # Пропускає введення ваги — одразу питає повтори для того ж підходу.
+        context.user_data["editing_last"] = False
+        ex_name = context.user_data["log_exercise"]
+        weight = context.user_data.get("log_weight")
+        await query.edit_message_text(
+            f"Вправа: {ex_name}\nВага: {fmt_kg(weight)} кг (та ж)\nСкільки повторів?",
+            reply_markup=reps_prompt_keyboard(),
+        )
+        return LOG_REPS
+    elif choice == "more_same":
         context.user_data["editing_last"] = False
         ex_name = context.user_data["log_exercise"]
         await query.edit_message_text(
@@ -958,16 +1302,18 @@ async def log_more_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return LOG_WEIGHT
     elif choice == "more_other":
         context.user_data["editing_last"] = False
+        return await show_log_exercise_list(query, context)
+    elif choice == "more_note":
         user_id = update.effective_user.id
-        names = get_all_exercise_names(user_id)
-        context.user_data["log_names_list"] = names
-        keyboard = [
-            [InlineKeyboardButton(n, callback_data=f"exi_{i}")] for i, n in enumerate(names)
-        ]
-        await query.edit_message_text(
-            "Яку вправу записуємо?", reply_markup=InlineKeyboardMarkup(keyboard)
+        existing = get_workout_note(user_id, date.today().isoformat())
+        text = "Введи нотатку до сьогоднішнього тренування (наприклад: «боліло плече», «було важко»):"
+        if existing:
+            text += f"\n\nПоточна нотатка: «{existing}»"
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_logmore")]]
         )
-        return LOG_EXERCISE
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return LOG_NOTE
     else:
         user_id = update.effective_user.id
         streak = get_streak(user_id)
@@ -976,6 +1322,23 @@ async def log_more_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Тренування записано. Гарного відновлення! 💪{streak_line}\nПодивитись: {BTN_TODAY}"
         )
         return ConversationHandler.END
+
+
+async def log_note_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    note = update.message.text.strip()
+    set_workout_note(user_id, date.today().isoformat(), note)
+    weight = context.user_data.get("log_weight")
+    await update.message.reply_text("Нотатку збережено ✅", reply_markup=log_more_keyboard(weight))
+    return LOG_MORE
+
+
+async def back_to_logmore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    weight = context.user_data.get("log_weight")
+    await query.edit_message_text("Що далі?", reply_markup=log_more_keyboard(weight))
+    return LOG_MORE
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1049,7 +1412,7 @@ async def send_history(message, user_id, ex_name, context, edit=None):
     else:
         lines = [f"📈 Прогрес: {ex_name} (найкращий підхід за тренування)\n"]
         for d, w, r in sessions:
-            lines.append(f"{d}: {w} кг x {r} повт.")
+            lines.append(f"{d}: {fmt_kg(w)} кг x {r} повт.")
         text = "\n".join(lines)
         context.user_data["chart_exercise"] = ex_name
         keyboard = InlineKeyboardMarkup(
@@ -1104,10 +1467,10 @@ async def records_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"Список застарів, спробуй {BTN_RECORDS} ще раз.")
         return
     ex_name = names[idx]
-    await send_record(query, update.effective_user.id, ex_name)
+    await send_record(query, update.effective_user.id, ex_name, context)
 
 
-async def send_record(query, user_id, ex_name):
+async def send_record(query, user_id, ex_name, context):
     row = get_max_weight_log(user_id, ex_name)
     if not row:
         await query.edit_message_text(f"Записів по вправі «{ex_name}» ще немає.")
@@ -1118,15 +1481,41 @@ async def send_record(query, user_id, ex_name):
 
     lines = [
         f"🏆 Рекорд: {ex_name}",
-        f"{row['weight']} кг x {row['reps']} повт. ({row['log_date']})",
-        f"💪 Розрахунковий 1ПМ (формула Еплі): {one_rm} кг",
+        f"{fmt_kg(row['weight'])} кг x {row['reps']} повт. ({row['log_date']})",
+        f"💪 Розрахунковий 1ПМ (формула Еплі): {fmt_kg(one_rm)} кг",
         "",
         "🎯 Рекомендовані ваги для періодизації навантажень (% від 1ПМ, за NSCA):",
     ]
     for label, w, reps in zones:
-        lines.append(f"{label}: {w} кг x {reps} повт.")
+        lines.append(f"{label}: {fmt_kg(w)} кг x {reps} повт.")
 
-    await query.edit_message_text("\n".join(lines))
+    context.user_data["pr_card"] = {
+        "ex_name": ex_name,
+        "weight": row["weight"],
+        "reps": row["reps"],
+        "one_rm": one_rm,
+    }
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🖼 Картка для шерингу", callback_data="share_pr_card")]]
+    )
+    await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
+
+
+async def share_pr_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = context.user_data.get("pr_card")
+    if not data:
+        await query.message.reply_text("Немає даних для картки.")
+        return
+    buf = generate_achievement_card(
+        f"🏆 {data['ex_name']}",
+        f"{fmt_kg(data['weight'])} кг x {data['reps']}",
+        f"1ПМ ≈ {fmt_kg(data['one_rm'])} кг",
+    )
+    await context.bot.send_photo(
+        chat_id=query.message.chat_id, photo=buf, caption="Поділись своїм прогресом! 💪"
+    )
 
 
 # ---------- ☕ Подякувати автору (Telegram Stars) ----------
@@ -1169,6 +1558,200 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     )
 
 
+# ---------- ⚖️ Моя вага (вага тіла) ----------
+async def bodyweight_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    last = get_last_bodyweight(user_id)
+    text = "Введи свою поточну вагу (кг):"
+    if last:
+        text += f"\n(Останній запис: {fmt_kg(last['weight'])} кг, {last['log_date']})"
+    await update.message.reply_text(text)
+    return BODYWEIGHT_INPUT
+
+
+async def bodyweight_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        weight = float(update.message.text.replace(",", ".").strip())
+    except ValueError:
+        await update.message.reply_text("Це не схоже на число. Введи вагу ще раз, наприклад: 82.5")
+        return BODYWEIGHT_INPUT
+
+    user_id = update.effective_user.id
+    prev = get_last_bodyweight(user_id, exclude_today=True)
+    add_or_update_bodyweight(user_id, weight)
+
+    text = f"Записано: {fmt_kg(weight)} кг ✅"
+    if prev:
+        diff = round(weight - prev["weight"], 2)
+        if diff != 0:
+            sign = "+" if diff > 0 else ""
+            text += f"\n({sign}{fmt_kg(diff)} кг від {prev['log_date']})"
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📊 Показати графік ваги", callback_data="show_bw_chart")]]
+    )
+    await update.message.reply_text(text, reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+async def show_bodyweight_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    series = get_bodyweight_history(user_id, limit=30)
+    if len(series) < 2:
+        await query.message.reply_text("Замало записів для графіка — потрібно хоча б 2.")
+        return
+
+    dates = [d for d, w in series]
+    weights = [w for d, w in series]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(dates, weights, marker="o", color="#2196F3", linewidth=2)
+    ax.set_title("Вага тіла")
+    ax.set_ylabel("Вага, кг")
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+
+    await context.bot.send_photo(chat_id=query.message.chat_id, photo=buf, caption="📊 Динаміка ваги тіла")
+
+
+# ---------- 📤 Експорт CSV ----------
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    csv_text = build_csv_export(user_id)
+    if not csv_text.strip() or csv_text.count("\n") <= 1:
+        await update.message.reply_text(
+            "Ще немає даних для експорту.", reply_markup=MAIN_MENU_KEYBOARD
+        )
+        return
+
+    buf = BytesIO(csv_text.encode("utf-8-sig"))  # utf-8-sig, щоб Excel коректно показував українські літери
+    buf.name = "workout_history.csv"
+    await update.message.reply_document(
+        document=buf, filename="workout_history.csv", caption="Твоя історія тренувань 📤"
+    )
+
+
+# ---------- 📢 Розсилка (лише для власника) ----------
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = os.environ.get("ADMIN_ID")
+    if not admin_id or str(update.effective_user.id) != str(admin_id):
+        return
+
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Використання: /broadcast текст повідомлення для всіх користувачів")
+        return
+
+    user_ids = get_all_user_ids()
+    sent = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            sent += 1
+        except Exception:
+            pass  # користувач заблокував бота або видалив чат — пропускаємо
+
+    await update.message.reply_text(f"Розіслано {sent}/{len(user_ids)} користувачам.")
+
+
+# ---------- 🔔 Нагадування, якщо давно не тренувався ----------
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    user_ids = get_users_needing_reminder(threshold_days=3)
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="Занудьгував за тобою 😄 Давно не було нових підходів — ще тренуєшся?",
+            )
+            mark_reminder_sent(uid)
+        except Exception:
+            pass  # користувач заблокував бота — пропускаємо
+
+
+# ---------- 📊 Тижневий звіт ----------
+async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    report = build_weekly_report(user_id)
+    if not report:
+        await update.message.reply_text(
+            "За останні 7 днів ще немає записаних тренувань.", reply_markup=MAIN_MENU_KEYBOARD
+        )
+        return
+
+    lines = [
+        f"📊 Тижневий звіт ({report['period_start']} – {report['period_end']})",
+        "",
+        f"🏋️ Тренувань: {report['days']}",
+        f"🔢 Підходів записано: {report['sets']}",
+        f"⚖️ Загальний тоннаж: {fmt_kg(report['tonnage'])} кг",
+    ]
+
+    if report["improvements"]:
+        lines.append("")
+        lines.append("📈 Найбільший прогрес (1ПМ) порівняно з попереднім тижнем:")
+        for ex, diff, prev_rm, rm in report["improvements"]:
+            lines.append(f"{ex}: {fmt_kg(prev_rm)} → {fmt_kg(rm)} кг (+{fmt_kg(diff)} кг)")
+
+    streak = get_streak(user_id)
+    if streak >= 2:
+        lines.append("")
+        lines.append(f"🔥 Стрік: {streak} {ukr_days_word(streak)} поспіль!")
+
+    context.user_data["weekly_card"] = {
+        "days": report["days"],
+        "tonnage": report["tonnage"],
+    }
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🖼 Картка для шерингу", callback_data="share_weekly_card")]]
+    )
+    await update.message.reply_text("\n".join(lines), reply_markup=keyboard)
+
+
+async def share_weekly_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = context.user_data.get("weekly_card")
+    if not data:
+        await query.message.reply_text("Немає даних для картки.")
+        return
+    buf = generate_achievement_card(
+        "📊 Тижневий звіт",
+        f"{fmt_kg(data['tonnage'])} кг",
+        f"загального тоннажу за {data['days']} тренувань",
+    )
+    await context.bot.send_photo(
+        chat_id=query.message.chat_id, photo=buf, caption="Поділись своїм тижнем! 💪"
+    )
+
+
+# ---------- Відстеження користувачів + статистика (лише для власника) ----------
+async def track_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user:
+        track_user(user.id, user.username)
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = os.environ.get("ADMIN_ID")
+    if not admin_id or str(update.effective_user.id) != str(admin_id):
+        return  # тихо ігноруємо для всіх, крім власника
+
+    stats = get_user_stats()
+    text = (
+        "📊 Статистика бота\n\n"
+        f"👥 Всього користувачів: {stats['total_users']}\n"
+        f"🏃 Активних за останні 7 днів: {stats['active_7d']}\n"
+        f"📝 Всього тренувань (людино-днів) записано: {stats['total_workouts']}"
+    )
+    await update.message.reply_text(text)
+
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1178,6 +1761,12 @@ def main():
 
     init_db()
     app = Application.builder().token(token).build()
+
+    # Відстежує кожного унікального користувача у фоні (group=-1 — не заважає іншим хендлерам)
+    app.add_handler(MessageHandler(filters.ALL, track_user_handler), group=-1)
+    app.add_handler(CallbackQueryHandler(track_user_handler), group=-1)
+
+    app.add_handler(CommandHandler("stats", stats_cmd))
 
     app.add_handler(CommandHandler("start", start))
 
@@ -1277,9 +1866,13 @@ def main():
             MessageHandler(filters.Text([BTN_LOG]), log_start),
         ],
         states={
+            LOG_DAY: [
+                CallbackQueryHandler(log_day_chosen, pattern=r"^logday_"),
+            ],
             LOG_EXERCISE: [
-                CallbackQueryHandler(log_exercise_chosen, pattern=r"^exi_"),
-                MessageHandler(free_text_filter, log_exercise_chosen),
+                CallbackQueryHandler(back_to_logday, pattern=r"^back_to_logday$"),
+                CallbackQueryHandler(log_exercise_chosen, pattern=r"^logexid_"),
+                MessageHandler(free_text_filter, log_custom_exercise_text),
             ],
             LOG_WEIGHT: [
                 CallbackQueryHandler(back_to_exercise, pattern=r"^back_to_exercise$"),
@@ -1290,6 +1883,10 @@ def main():
                 MessageHandler(free_text_filter, log_reps_chosen),
             ],
             LOG_MORE: [CallbackQueryHandler(log_more_chosen, pattern=r"^more_")],
+            LOG_NOTE: [
+                CallbackQueryHandler(back_to_logmore, pattern=r"^back_to_logmore$"),
+                MessageHandler(free_text_filter, log_note_saved),
+            ],
             ConversationHandler.TIMEOUT: [timeout_handler],
         },
         fallbacks=[CommandHandler("cancel", cancel), other_commands_fallback, menu_button_fallback],
@@ -1305,6 +1902,34 @@ def main():
     app.add_handler(CommandHandler("records", records_cmd))
     app.add_handler(MessageHandler(filters.Text([BTN_RECORDS]), records_cmd))
     app.add_handler(CallbackQueryHandler(records_callback, pattern=r"^pri_"))
+
+    app.add_handler(CommandHandler("weekly", weekly_report_cmd))
+    app.add_handler(MessageHandler(filters.Text([BTN_WEEKLY]), weekly_report_cmd))
+    app.add_handler(CallbackQueryHandler(share_pr_card_callback, pattern=r"^share_pr_card$"))
+    app.add_handler(CallbackQueryHandler(share_weekly_card_callback, pattern=r"^share_weekly_card$"))
+
+    bodyweight_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("bodyweight", bodyweight_start),
+            MessageHandler(filters.Text([BTN_BODYWEIGHT]), bodyweight_start),
+        ],
+        states={
+            BODYWEIGHT_INPUT: [MessageHandler(free_text_filter, bodyweight_save)],
+            ConversationHandler.TIMEOUT: [timeout_handler],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), other_commands_fallback, menu_button_fallback],
+        conversation_timeout=CONVERSATION_TIMEOUT,
+    )
+    app.add_handler(bodyweight_conv)
+    app.add_handler(CallbackQueryHandler(show_bodyweight_chart_callback, pattern=r"^show_bw_chart$"))
+
+    app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(MessageHandler(filters.Text([BTN_EXPORT]), export_cmd))
+
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+
+    if app.job_queue:
+        app.job_queue.run_daily(reminder_job, time=dt_time(hour=9, minute=0))
 
     logger.info("Бот запущено...")
     app.run_polling()
